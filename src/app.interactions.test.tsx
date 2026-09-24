@@ -23,7 +23,7 @@ import React from 'react'
 // 条件失败时兜底，从而精确制造“前一动作重算成功、后一动作重算异常”的
 // 交错序列（vi.mock 工厂会被提升，外部普通变量处于 TDZ，故必须用 hoisted）。
 const maskHolder = vi.hoisted(() => ({
-  realMaskText: null as null | ((text: string, patterns: readonly string[]) => unknown),
+  realMaskText: null as null | ((text: string, patterns: readonly string[], exemptions?: unknown) => unknown),
 }))
 vi.mock('./core/masker', async () => {
   const actual = await vi.importActual<typeof import('./core/masker')>('./core/masker')
@@ -38,8 +38,18 @@ import { maskText, type MaskResult } from './core/masker'
 import App from './App'
 
 const mockedMaskText = vi.mocked(maskText)
-const realMaskText = (text: string, patterns: readonly string[]): MaskResult =>
-  (maskHolder.realMaskText as (t: string, p: readonly string[]) => MaskResult)(text, patterns)
+const realMaskText = (
+  text: string,
+  patterns: readonly string[],
+  exemptions?: readonly import('./core/masker').ExemptionHit[],
+): MaskResult =>
+  (
+    maskHolder.realMaskText as (
+      t: string,
+      p: readonly string[],
+      e?: readonly import('./core/masker').ExemptionHit[],
+    ) => MaskResult
+  )(text, patterns, exemptions)
 
 const mounted: Array<{ root: Root; container: HTMLElement }> = []
 
@@ -147,13 +157,21 @@ const workPreview = (c: HTMLElement) => c.querySelectorAll('pre.text-view')[0]!.
 const adoptedPreview = (c: HTMLElement) =>
   c.querySelectorAll('pre.text-view')[1]?.textContent ?? null
 const notice = (c: HTMLElement) => c.querySelector('[role=alert]')?.textContent ?? null
+
+// --- 单次豁免控件 ---
+const rowPosInput = (r: HTMLElement) =>
+  r.querySelector<HTMLInputElement>('input.pos')
+const rowExemptBtn = (r: HTMLElement) =>
+  [...r.querySelectorAll<HTMLButtonElement>('button')].find((b) => b.textContent === '豁免此处')!
+const rowChips = (r: HTMLElement) => [...r.querySelectorAll<HTMLButtonElement>('button.chip')]
 /** 短语管理区的“显示 N / M 条”统计（DOM 中第一个 .stats，位于预览统计之前） */
 const listStats = (c: HTMLElement) =>
   c.querySelector('.pattern-list')!.querySelector('.stats')!.textContent!
 
 /**
  * 成套一致性断言：列表行（值 / 启停 / 计数文案）与工作预览同源于一次
- * 成功快照；零命中为 0，停用为“未统计”。
+ * 成功快照；零有效命中为 0，停用为“未统计”。计数节点可附带“（豁免 N）”
+ * 标注，断言只比对其开头的有效命中数字。
  */
 function expectRowsCoherent(
   c: HTMLElement,
@@ -164,9 +182,11 @@ function expectRowsCoherent(
   for (let i = 0; i < expected.length; i++) {
     expect(rowText(rs[i]).value).toBe(expected[i].value)
     expect(rowCheck(rs[i]).checked).toBe(expected[i].enabled)
-    expect(rowCount(rs[i]).textContent).toBe(
-      expected[i].count === null ? '未统计' : String(expected[i].count),
-    )
+    if (expected[i].count === null) {
+      expect(rowCount(rs[i]).textContent).toBe('未统计')
+    } else {
+      expect(rowCount(rs[i]).textContent!.startsWith(String(expected[i].count))).toBe(true)
+    }
   }
 }
 
@@ -652,5 +672,242 @@ describe('聚合约束：总长上界 300,000 的连续增改、启停、筛选�
     click(buttonByText(c, '添加'))
     expect(notice(c)).toBe('LIMITS_EXCEEDED')
     expect(adoptedPreview(c)).toBe('#')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// 单次豁免的界面验收：从启用条目指定起始代码单元，核实为同一行内完整命中
+// 后只放过这一次；无效位置 / 停用 / 清理 / 撤销 / 采纳固化成套一致。
+// ---------------------------------------------------------------------------
+describe('单次豁免：工作台交互', () => {
+  /** 在行内位置框输入数字（触发 input），不提交 */
+  function typePos(el: HTMLInputElement, value: string) {
+    act(() => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!
+      setter.call(el, value)
+      el.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+  }
+
+  it('指定起始代码单元豁免命中：只放过该处，其他位置仍遮蔽，计数/覆盖同源更新', async () => {
+    // 'abc' 三次：0、7、14；x 两次（"xx"）；yy 不被任何短语遮蔽
+    const c = await renderApp('abc xx abc yy abc', ['abc', 'x'])
+    const r0 = rows(c)[0]
+    // 初始：abc 有效命中 3，预览全覆盖 abc 与 xx，yy 保留
+    expect(rowCount(r0).textContent!.startsWith('3')).toBe(true)
+    expect(workPreview(c)).toBe('### ## ### yy ###')
+
+    typePos(rowPosInput(r0)!, '7')
+    click(rowExemptBtn(r0))
+    expect(notice(c)).toBeNull()
+    // 中间那次还原，首尾仍遮蔽
+    expect(workPreview(c)).toBe('### ## abc yy ###')
+    // 计数显示有效命中 2 + 豁免标注
+    expect(rowCount(r0).textContent).toContain('2')
+    expect(rowCount(r0).textContent).toContain('豁免 1')
+    // 出现可撤销的 chip（起点 7）
+    const chips = rowChips(r0)
+    expect(chips).toHaveLength(1)
+    expect(chips[0].textContent).toContain('7')
+    // 同词其他位置仍遮蔽
+    expect(workPreview(c)[0]).toBe('#')
+    expect(workPreview(c)[14]).toBe('#')
+    // x 的遮蔽不受影响
+    expect(workPreview(c)[4]).toBe('#')
+    expect(workPreview(c)[5]).toBe('#')
+  })
+
+  it('撤销 chip：该命中恢复遮蔽，计数回升，chip 消失', async () => {
+    const c = await renderApp('abc xx abc yy abc', ['abc'])
+    const r0 = rows(c)[0]
+    typePos(rowPosInput(r0)!, '7')
+    click(rowExemptBtn(r0))
+    expect(workPreview(c)).toBe('### xx abc yy ###')
+    click(rowChips(r0)[0])
+    expect(notice(c)).toBeNull()
+    expect(workPreview(c)).toBe('### xx ### yy ###')
+    expect(rowChips(r0)).toHaveLength(0)
+    expect(rowCount(r0).textContent!.startsWith('3')).toBe(true)
+    expect(rowCount(r0).textContent).not.toContain('豁免')
+  })
+
+  it('无效位置（非命中/越界/负数）→ INVALID_POSITION：输入保留，预览不变', async () => {
+    const c = await renderApp('abc\nabc', ['abc'])
+    const r0 = rows(c)[0]
+    const before = workPreview(c)
+    for (const bad of ['1', '5', '-1', '3']) {
+      typePos(rowPosInput(r0)!, bad)
+      click(rowExemptBtn(r0))
+      expect(notice(c)).toBe('INVALID_POSITION')
+      expect(workPreview(c)).toBe(before)
+      expect(rowChips(r0)).toHaveLength(0)
+      expect(rowPosInput(r0)!.value).toBe(bad) // 输入保留便于修改
+    }
+    // 改成真实行内起点 0 后成功，错误清除，输入清空
+    typePos(rowPosInput(r0)!, '0')
+    click(rowExemptBtn(r0))
+    expect(notice(c)).toBeNull()
+    expect(rowPosInput(r0)!.value).toBe('')
+    expect(rowChips(r0)).toHaveLength(1)
+  })
+
+  it('重复豁免同一位置幂等：不新增 chip、计数不变', async () => {
+    const c = await renderApp('abc abc', ['abc'])
+    const r0 = rows(c)[0]
+    typePos(rowPosInput(r0)!, '0')
+    click(rowExemptBtn(r0))
+    typePos(rowPosInput(r0)!, '0')
+    click(rowExemptBtn(r0))
+    expect(notice(c)).toBeNull()
+    expect(rowChips(r0)).toHaveLength(1)
+    expect(rowCount(r0).textContent).toContain('豁免 1')
+  })
+
+  it('豁免不抹掉其他短语在同一区域的遮蔽（嵌套/重叠）', async () => {
+    const c = await renderApp('abcdef', ['abcdef', 'bc'])
+    // 豁免长词 abcdef@0
+    const rLong = rows(c)[0]
+    typePos(rowPosInput(rLong)!, '0')
+    click(rowExemptBtn(rLong))
+    // 长词命中被豁免，但 'bc'（位置 1..2）仍遮蔽：a##def
+    expect(workPreview(c)).toBe('a##def')
+    // 再豁免 'bc'@1：位置 1..2 也还原 → abcdef
+    const rShort = rows(c)[1]
+    typePos(rowPosInput(rShort)!, '1')
+    click(rowExemptBtn(rShort))
+    expect(workPreview(c)).toBe('abcdef')
+  })
+
+  it('停用短语：豁免控件消失；停用清理其豁免，重新启用空簿起步', async () => {
+    const c = await renderApp('abc abc', ['abc'])
+    const r0 = rows(c)[0]
+    typePos(rowPosInput(r0)!, '0')
+    click(rowExemptBtn(r0))
+    expect(rowChips(r0)).toHaveLength(1)
+    // 停用：豁免行整体消失，计数“未统计”
+    click(rowCheck(r0))
+    expect(rowPosInput(rows(c)[0])).toBeNull()
+    expect(rowCount(rows(c)[0]).textContent).toBe('未统计')
+    expect(workPreview(c)).toBe('abc abc')
+    // 重新启用：无豁免复活
+    click(rowCheck(rows(c)[0]))
+    expect(rowChips(rows(c)[0])).toHaveLength(0)
+    expect(rowCount(rows(c)[0]).textContent!.startsWith('2')).toBe(true)
+    expect(workPreview(c)).toBe('### ###')
+  })
+
+  it('改值后旧豁免清空；删除短语连带豁免；新增条目空豁免', async () => {
+    const c = await renderApp('abc abc bbb', ['abc', 'bbb'])
+    const r0 = rows(c)[0]
+    typePos(rowPosInput(r0)!, '0')
+    click(rowExemptBtn(r0))
+    expect(rowChips(r0)).toHaveLength(1)
+    // 改值（改成与现有值不重复的 'bcd'）：保位但豁免清空
+    typeInto(rowText(r0), 'bcd')
+    act(() => rowText(r0).blur())
+    expect(notice(c)).toBeNull()
+    expect(rowChips(rows(c)[0])).toHaveLength(0)
+    // 新增第三条：空豁免
+    const addInput = c
+      .querySelector<HTMLElement>('.add-row')!
+      .querySelector<HTMLInputElement>('input')!
+    typeInto(addInput, 'x')
+    click(buttonByText(c, '添加'))
+    expect(rowChips(rows(c)[2])).toHaveLength(0)
+    // 删除第 0 条：其余行豁免槽不串位（本来就空）
+    click(rowDelete(rows(c)[0]))
+    expect(rows(c).length).toBe(2)
+  })
+
+  it('采纳固化豁免与遮蔽；之后再加豁免不改采纳稿，再次采纳才更新', async () => {
+    const c = await renderApp('abc xx abc yy abc', ['abc'])
+    const r0 = rows(c)[0]
+    typePos(rowPosInput(r0)!, '7')
+    click(rowExemptBtn(r0))
+    const first = '### xx abc yy ###'
+    expect(workPreview(c)).toBe(first)
+    click(buttonByText(c, '采纳为下载稿'))
+    expect(adoptedPreview(c)).toBe(first)
+
+    // 再豁免第一处：工作预览变化，采纳稿不动
+    typePos(rowPosInput(rows(c)[0])!, '0')
+    click(rowExemptBtn(rows(c)[0]))
+    expect(workPreview(c)).toBe('abc xx abc yy ###')
+    expect(adoptedPreview(c)).toBe(first)
+
+    // 再次采纳：下载稿更新
+    click(buttonByText(c, '采纳为下载稿'))
+    expect(adoptedPreview(c)).toBe(workPreview(c))
+  })
+
+  it('放弃改动：豁免与工作集一起回滚到已采纳稿', async () => {
+    const c = await renderApp('abc xx abc yy abc', ['abc'])
+    // 先采纳“豁免中间一次”的状态
+    typePos(rowPosInput(rows(c)[0])!, '7')
+    click(rowExemptBtn(rows(c)[0]))
+    click(buttonByText(c, '采纳为下载稿'))
+    const adopted = workPreview(c)
+    // 再豁免第一处（未采纳）
+    typePos(rowPosInput(rows(c)[0])!, '0')
+    click(rowExemptBtn(rows(c)[0]))
+    expect(workPreview(c)).not.toBe(adopted)
+    // 放弃：回到采纳稿（中间豁免保留、第一处豁免撤销）
+    click(buttonByText(c, '放弃改动'))
+    expect(workPreview(c)).toBe(adopted)
+    expect(rowChips(rows(c)[0])).toHaveLength(1)
+    expect(notice(c)).toBeNull()
+  })
+
+  it('载入新文本清空旧豁免', async () => {
+    const c = await renderApp('abc abc', ['abc'])
+    typePos(rowPosInput(rows(c)[0])!, '0')
+    click(rowExemptBtn(rows(c)[0]))
+    expect(rowChips(rows(c)[0])).toHaveLength(1)
+    // 重新载入相似文本
+    const input = c.querySelector<HTMLInputElement>('input[type=file]')!
+    Object.defineProperty(input, 'files', {
+      value: [new File([JSON.stringify({ text: 'abc abc', patterns: ['abc'] })], 'in.json', { type: 'application/json' })],
+      configurable: true,
+    })
+    await act(async () => {
+      input.dispatchEvent(new Event('change', { bubbles: true }))
+      await Promise.resolve()
+    })
+    expect(rowChips(rows(c)[0])).toHaveLength(0)
+    expect(workPreview(c)).toBe('### ###')
+  })
+
+  it('重算失败（注入）时豁免不生效，旧预览保留；恢复后可正常豁免', async () => {
+    const c = await renderApp('abc abc', ['abc'])
+    mockedMaskText.mockImplementationOnce(() => {
+      throw new Error('boom on exempt')
+    })
+    typePos(rowPosInput(rows(c)[0])!, '0')
+    click(rowExemptBtn(rows(c)[0]))
+    expect(notice(c)).toBe('COUNT_FAILED')
+    expect(workPreview(c)).toBe('### ###') // 旧预览保留
+    expect(rowChips(rows(c)[0])).toHaveLength(0)
+    expect(rowPosInput(rows(c)[0])!.value).toBe('0') // 输入保留
+    // 恢复
+    mockedMaskText.mockReset()
+    mockedMaskText.mockImplementation(((...args) => realMaskText(...args)) as typeof maskText)
+    click(rowExemptBtn(rows(c)[0]))
+    expect(notice(c)).toBeNull()
+    expect(workPreview(c)).toBe('abc ###')
+    expect(rowChips(rows(c)[0])).toHaveLength(1)
+  })
+
+  it('自重叠命中可逐个豁免：aaaa + aa 的三个起点', async () => {
+    const c = await renderApp('aaaa', ['aa'])
+    const r0 = rows(c)[0]
+    // 豁免起点 0 和 2：保留起点 1 的命中（覆盖 1..2）→ a##a
+    for (const pos of ['0', '2']) {
+      typePos(rowPosInput(r0)!, pos)
+      click(rowExemptBtn(r0))
+    }
+    expect(workPreview(c)).toBe('a##a')
+    expect(rowCount(r0).textContent).toContain('1') // 有效命中剩 1
+    expect(rowCount(r0).textContent).toContain('豁免 2')
+    expect(rowChips(r0)).toHaveLength(2)
   })
 })

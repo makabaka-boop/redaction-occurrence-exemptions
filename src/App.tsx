@@ -8,9 +8,12 @@ import {
 } from './core/masker'
 import {
   adopt,
+  addExemption,
   addPattern,
   countByEntry,
+  exemptCountByEntry,
   loadSession,
+  removeExemption,
   removePattern,
   rollback,
   setPatternEnabled,
@@ -26,10 +29,13 @@ import {
   windowStart,
 } from './core/patternList'
 import { newRowId, patchEntryIds, reconcileEntryIds, type EntryIdPatch } from './core/rowIdentity'
+import { sameExemptions, totalExemptions } from './core/exemptions'
 
 interface Draft {
   masked: string
   entries: PatternEntry[]
+  /** 采纳时固化的豁免簿（与 masked、entries 成套） */
+  exemptionSlots: number[][]
 }
 
 export default function App() {
@@ -77,6 +83,7 @@ export default function App() {
 
   // 当前工作集相对已采纳稿（无采纳稿时相对文件载入态）是否有未决改动
   const basis = draft?.entries ?? session?.initial ?? []
+  const basisExemptions = draft?.exemptionSlots ?? session?.initialExemptions ?? []
   const dirty = useMemo(() => {
     if (!snapshot) return false
     const entries = snapshot.entries
@@ -84,8 +91,9 @@ export default function App() {
     for (let i = 0; i < entries.length; i++) {
       if (entries[i].value !== basis[i].value || entries[i].enabled !== basis[i].enabled) return true
     }
-    return false
-  }, [snapshot, basis])
+    // 豁免簿也是工作集的一部分：豁免增减同样属于未决改动
+    return !sameExemptions(snapshot.exemptions, basisExemptions)
+  }, [snapshot, basis, basisExemptions])
 
   const handleFile = useCallback(async (file: File) => {
     let raw: string
@@ -161,8 +169,13 @@ export default function App() {
     const current = snapshotRef.current
     if (!current) return
     const next = adopt(current)
-    draftRef.current = next
-    setDraft(next)
+    const frozen = {
+      masked: next.masked,
+      entries: next.entries,
+      exemptionSlots: next.exemptions.map((s) => s.slice()),
+    }
+    draftRef.current = frozen
+    setDraft(frozen)
     setNotice(null)
   }, [])
 
@@ -171,7 +184,7 @@ export default function App() {
     if (!session || !current) return
     try {
       const t0 = performance.now()
-      const next = rollback(session.text, basis)
+      const next = rollback(session.text, basis, basisExemptions)
       setElapsed(performance.now() - t0)
       commitSnapshot(next, current.entries)
       setNotice(null)
@@ -179,7 +192,7 @@ export default function App() {
       // 回滚重算理论上不会失败（基线来自上次成功快照）；保险起见保留现状
       setNotice(err instanceof MaskError ? err.code : COUNT_FAILED)
     }
-  }, [session, basis, commitSnapshot])
+  }, [session, basis, basisExemptions, commitSnapshot])
 
   const handleDownload = useCallback(() => {
     // 始终从权威镜像取稿，保证下载文本与屏幕所采纳内容为同一字符串
@@ -195,11 +208,67 @@ export default function App() {
     URL.revokeObjectURL(url)
   }, [])
 
+  /**
+   * 单次豁免：为某条启用短语在原文起始代码单元处放过**这一个**完整命中。
+   * 与普通变更同走权威快照；位置核实（INVALID_POSITION）、豁免数量上界
+   * （LIMITS_EXCEEDED）与重算（COUNT_FAILED）都发生在提交之前，失败只
+   * 拒绝自身，预览与已采纳稿保留上一次完整成功状态。
+   */
+  const runExempt = useCallback(
+    (index: number, start: number): boolean => {
+      const current = snapshotRef.current
+      if (!current) return false
+      try {
+        const t0 = performance.now()
+        const next = addExemption(current, index, start)
+        setElapsed(performance.now() - t0)
+        commitSnapshot(next, current.entries)
+        setNotice(null)
+        return true
+      } catch (err) {
+        setNotice(err instanceof MaskError ? err.code : COUNT_FAILED)
+        return false
+      }
+    },
+    [commitSnapshot],
+  )
+
+  /** 撤销一次单次豁免（幂等）；同样从同一工作集整体重算。 */
+  const runUnexempt = useCallback(
+    (index: number, start: number): boolean => {
+      const current = snapshotRef.current
+      if (!current) return false
+      try {
+        const t0 = performance.now()
+        const next = removeExemption(current, index, start)
+        setElapsed(performance.now() - t0)
+        commitSnapshot(next, current.entries)
+        setNotice(null)
+        return true
+      } catch (err) {
+        setNotice(err instanceof MaskError ? err.code : COUNT_FAILED)
+        return false
+      }
+    },
+    [commitSnapshot],
+  )
+
   const entries = snapshot?.entries ?? []
   const result = snapshot?.result ?? null
   // 计数映射回完整工作集下标；筛选/窗口化后仍按原始下标取数
   const counts = useMemo(
     () => (snapshot ? countByEntry(snapshot.entries, snapshot.result) : []),
+    [snapshot],
+  )
+  // 每条工作集条目当前生效的豁免数（停用项恒为 0）
+  const exemptCounts = useMemo(
+    () => (snapshot ? exemptCountByEntry(snapshot.entries, snapshot.result) : []),
+    [snapshot],
+  )
+  // 豁免起始位置按完整工作集下标直取（豁免簿与条目一一对应，无需映射）
+  const exemptionSlots = snapshot?.exemptions ?? []
+  const exemptTotal = useMemo(
+    () => (snapshot ? totalExemptions(snapshot.exemptions) : 0),
     [snapshot],
   )
   const enabledCount = useMemo(() => {
@@ -237,17 +306,21 @@ export default function App() {
       {session && snapshot && result && (
         <>
           <section className="card">
-            <h2>2. 短语管理（增改 / 启停 / 删除）</h2>
+            <h2>2. 短语管理（增改 / 启停 / 删除 / 单次豁免）</h2>
             <AddRow onAdd={(v) => runChange((s) => addPattern(s, v), { type: 'append' })} />
             <PatternList
               entries={entries}
               rowIds={rowIds}
               counts={counts}
+              exemptCounts={exemptCounts}
+              exemptionSlots={exemptionSlots}
               onUpdate={(i, v) => runChange((s) => updatePattern(s, i, v))}
               onToggle={(i, en) => runChange((s) => setPatternEnabled(s, i, en))}
               onRemove={(i) =>
                 runChange((s) => removePattern(s, i), { type: 'removeAt', index: i })
               }
+              onExempt={(i, start) => runExempt(i, start)}
+              onUnexempt={(i, start) => runUnexempt(i, start)}
             />
           </section>
 
@@ -257,11 +330,15 @@ export default function App() {
               原文 {session.text.length.toLocaleString()} 代码单元 · 启用{' '}
               {enabledCount.toLocaleString()} / {entries.length.toLocaleString()} 条 · 遮蔽{' '}
               {result.coveredCount.toLocaleString()} 代码单元（覆盖并集，非命中次数） ·
-              重算耗时 {elapsed.toFixed(1)} ms
+              单次豁免 {exemptTotal.toLocaleString()} 处（每条短语 ≤{' '}
+              {LIMITS.maxExemptionsPerEntry}、总数 ≤{' '}
+              {LIMITS.maxExemptionsTotal.toLocaleString()}） · 重算耗时 {elapsed.toFixed(1)} ms
             </p>
             <p className="hint">
-              每条短语右侧为其在原文中的<strong>完整匹配次数</strong>
-              （区分大小写、允许自重叠、不跨换行）；零命中显示 0，停用项显示“未统计”。
+              每条短语右侧为其<strong>有效命中次数</strong>（完整匹配次数减去被单次豁免的命中；
+              区分大小写、允许自重叠、不跨换行）；零命中显示 0，停用项显示“未统计”。
+              在行内输入命中的<strong>起始代码单元</strong>并“豁免此处”，经核实确为同一行内的
+              完整命中后只放过这一次命中；其他位置、其他短语在同一区域的遮蔽不受影响。
               计数与预览来自同一次重算；{COUNT_FAILED} 时保留上一次成功结果。
             </p>
             <pre className="text-view" aria-label="遮蔽预览">{result.masked}</pre>
@@ -325,17 +402,27 @@ function PatternList({
   entries,
   rowIds,
   counts,
+  exemptCounts,
+  exemptionSlots,
   onUpdate,
   onToggle,
   onRemove,
+  onExempt,
+  onUnexempt,
 }: {
   entries: PatternEntry[]
   /** 与 entries 一一对应的稳定行 ID（改值不变，新增才换） */
   rowIds: string[]
   counts: Array<number | null>
+  /** 每条条目本次重算中生效的豁免数（停用项 0） */
+  exemptCounts: number[]
+  /** 与 entries 一一对应的豁免起始位置槽 */
+  exemptionSlots: readonly (readonly number[])[]
   onUpdate: (index: number, value: string) => boolean
   onToggle: (index: number, enabled: boolean) => void
   onRemove: (index: number) => void
+  onExempt: (index: number, start: number) => boolean
+  onUnexempt: (index: number, start: number) => void
 }) {
   const [filter, setFilter] = useState('')
   const [scrollTop, setScrollTop] = useState(0)
@@ -379,10 +466,14 @@ function PatternList({
               key={rowIds[index]}
               entry={entry}
               count={counts[index]}
+              exemptCount={exemptCounts[index] ?? 0}
+              slots={exemptionSlots[index] ?? []}
               top={(first + k) * ROW_HEIGHT}
               onUpdate={(v) => onUpdate(index, v)}
               onToggle={(en) => onToggle(index, en)}
               onRemove={() => onRemove(index)}
+              onExempt={(start) => onExempt(index, start)}
+              onUnexempt={(start) => onUnexempt(index, start)}
             />
           ))}
         </div>
@@ -394,20 +485,31 @@ function PatternList({
 function PatternRow({
   entry,
   count,
+  exemptCount,
+  slots,
   top,
   onUpdate,
   onToggle,
   onRemove,
+  onExempt,
+  onUnexempt,
 }: {
   entry: PatternEntry
   count: number | null
+  exemptCount: number
+  slots: readonly number[]
   top: number
   onUpdate: (value: string) => boolean
   onToggle: (enabled: boolean) => void
   onRemove: () => void
+  onExempt: (start: number) => boolean
+  onUnexempt: (start: number) => void
 }) {
   const [draftValue, setDraftValue] = useState(entry.value)
   const [editing, setEditing] = useState(false)
+  // 豁免起始位置的本地草稿（0 基 UTF-16 代码单元）；成功才清空，
+  // INVALID_POSITION / LIMITS_EXCEEDED 时保留输入便于修改。
+  const [posDraft, setPosDraft] = useState('')
 
   const commit = () => {
     // 非法时外层不提交；保持编辑态和原值，便于继续修改
@@ -417,41 +519,101 @@ function PatternRow({
     setEditing(false)
   }
 
+  const submitExempt = () => {
+    if (posDraft === '') return
+    const start = Number(posDraft)
+    // Number.isFinite 挡住空串/NaN/Infinity；非整数交给会话层 INVALID_POSITION
+    if (Number.isFinite(start) && onExempt(start)) setPosDraft('')
+  }
+
   return (
     <div className="pattern-row" style={{ transform: `translateY(${top}px)` }}>
-      <input
-        type="checkbox"
-        checked={entry.enabled}
-        onChange={(e) => onToggle(e.target.checked)}
-        aria-label="启用"
-      />
-      <input
-        type="text"
-        className={`value ${entry.enabled ? '' : 'off'}`}
-        value={editing ? draftValue : entry.value}
-        maxLength={LIMITS.maxPatternLength}
-        onFocus={() => {
-          setDraftValue(entry.value)
-          setEditing(true)
-        }}
-        onChange={(e) => setDraftValue(e.target.value)}
-        onBlur={commit}
-        onKeyDown={(e) => {
-          if (e.key === 'Enter') e.currentTarget.blur()
-          if (e.key === 'Escape') {
+      <div className="row-main">
+        <input
+          type="checkbox"
+          checked={entry.enabled}
+          onChange={(e) => onToggle(e.target.checked)}
+          aria-label="启用"
+        />
+        <input
+          type="text"
+          className={`value ${entry.enabled ? '' : 'off'}`}
+          value={editing ? draftValue : entry.value}
+          maxLength={LIMITS.maxPatternLength}
+          onFocus={() => {
             setDraftValue(entry.value)
-            setEditing(false)
+            setEditing(true)
+          }}
+          onChange={(e) => setDraftValue(e.target.value)}
+          onBlur={commit}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') e.currentTarget.blur()
+            if (e.key === 'Escape') {
+              setDraftValue(entry.value)
+              setEditing(false)
+            }
+          }}
+        />
+        <span
+          className={`count ${entry.enabled ? '' : 'off'}`}
+          title={
+            entry.enabled
+              ? '有效命中次数（完整匹配减去被单次豁免的命中；区分大小写、允许自重叠、不跨换行）'
+              : '停用项未统计'
           }
-        }}
-      />
-      <span
-        className={`count ${entry.enabled ? '' : 'off'}`}
-        title={entry.enabled ? '原文中的完整匹配次数（区分大小写、允许自重叠、不跨换行）' : '停用项未统计'}
-        aria-label={entry.enabled ? `匹配次数 ${count}` : '未统计'}
-      >
-        {count === null ? '未统计' : count.toLocaleString()}
-      </span>
-      <button type="button" onClick={onRemove}>删除</button>
+          aria-label={entry.enabled ? `有效命中次数 ${count}` : '未统计'}
+        >
+          {count === null ? '未统计' : count.toLocaleString()}
+          {entry.enabled && exemptCount > 0 && (
+            <span className="exempt-note" title={`本条已豁免 ${exemptCount} 处单次命中`}>
+              （豁免 {exemptCount.toLocaleString()}）
+            </span>
+          )}
+        </span>
+        <button type="button" className="remove-btn" onClick={onRemove}>删除</button>
+      </div>
+      {entry.enabled && (
+        <div className="row-exempt">
+          <span className="exempt-label">单次豁免起始代码单元：</span>
+          <input
+            type="number"
+            className="pos"
+            min={0}
+            step={1}
+            value={posDraft}
+            placeholder="如 12"
+            aria-label="豁免起始代码单元"
+            onChange={(e) => setPosDraft(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') submitExempt()
+            }}
+          />
+          <button
+            type="button"
+            className="exempt-btn"
+            onClick={submitExempt}
+            title="核实该处确为同一行内的完整命中后，只豁免这一次命中"
+          >
+            豁免此处
+          </button>
+          {slots.length > 0 && (
+            <span className="chips">
+              {slots.map((start) => (
+                <button
+                  type="button"
+                  className="chip"
+                  key={start}
+                  title={`撤销起始代码单元 ${start} 处的单次豁免`}
+                  aria-label={`撤销豁免 ${start}`}
+                  onClick={() => onUnexempt(start)}
+                >
+                  {start.toLocaleString()} ✕
+                </button>
+              ))}
+            </span>
+          )}
+        </div>
+      )}
     </div>
   )
 }

@@ -10,8 +10,12 @@
 
 import type { PatternEntry } from './masker'
 
-/** 行高（px）、视口高（px）与上下各缓冲的行数 */
-export const ROW_HEIGHT = 34
+/**
+ * 行高（px）、视口高（px）与上下各缓冲的行数。
+ * 每行含“主行（启停/短语/计数/删除）”与“单次豁免行（位置输入 + 豁免
+ * 标记）”两条水平带，故行高高于单行。
+ */
+export const ROW_HEIGHT = 58
 export const VIEW_HEIGHT = 360
 export const BUFFER = 8
 

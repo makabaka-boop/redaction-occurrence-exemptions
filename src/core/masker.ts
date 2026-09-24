@@ -30,16 +30,26 @@ export const LIMITS = {
   maxPatternLength: 200,
   /** 全部短语长度总和不超过三十万 */
   maxTotalPatternLength: 300_000,
+  /** 单条启用短语允许持有的单次豁免数量上界（有限数量） */
+  maxExemptionsPerEntry: 100,
+  /** 整个工作集允许持有的单次豁免总数上界 */
+  maxExemptionsTotal: 10_000,
 } as const
 
 export const INVALID_INPUT = 'INVALID_INPUT'
 export const INVALID_PATTERN = 'INVALID_PATTERN'
+/**
+ * 单次豁免位置非法：非整数 / 越界 / 落在换行上（跨换行）/ 该起始代码单元
+ * 并非该启用短语的完整命中。会话层在重算之前拒绝，旧预览与采纳稿保留。
+ */
+export const INVALID_POSITION = 'INVALID_POSITION'
 /** 自动机构建、遮蔽或计数阶段异常；此时保留上一次成功的工作集/预览/计数/采纳稿 */
 export const COUNT_FAILED = 'COUNT_FAILED'
 /**
- * 编辑后的工作集违反**聚合约束**（条目数 1..50,000 或总长 > 300,000）。
- * 与文件导入同源同一组约束：越界动作在重算之前被拒绝，绝不重建自动机、
- * 绝不提交快照。数量低于最小数量（删除唯一短语）同样用本错误码。
+ * 编辑后的工作集违反**聚合约束**（条目数 1..50,000 或总长 > 300,000），
+ * 或单次豁免超过数量上界（每条 100、全局 10,000）。与文件导入同源同一组
+ * 约束：越界动作在重算之前被拒绝，绝不重建自动机、绝不提交快照。
+ * 数量低于最小数量（删除唯一短语）同样用本错误码。
  */
 export const LIMITS_EXCEEDED = 'LIMITS_EXCEEDED'
 
@@ -47,12 +57,14 @@ export class MaskError extends Error {
   readonly code:
     | typeof INVALID_INPUT
     | typeof INVALID_PATTERN
+    | typeof INVALID_POSITION
     | typeof COUNT_FAILED
     | typeof LIMITS_EXCEEDED
   constructor(
     code:
       | typeof INVALID_INPUT
       | typeof INVALID_PATTERN
+      | typeof INVALID_POSITION
       | typeof COUNT_FAILED
       | typeof LIMITS_EXCEEDED,
   ) {
@@ -213,6 +225,11 @@ interface Automaton {
   go: (state: number, charCode: number) => number
   /** 该状态沿失败链可达的最长字典词长度，0 表示无匹配（≤ 200） */
   outLen: Uint16Array
+  /**
+   * 终止状态自身的字典词长度（不在失败链上传播），0 表示非终止态。
+   * 供单次豁免的终点沿失败链枚举“恰好在此结束”的各长度匹配。
+   */
+  termLen: Uint16Array
   /** 失败链：fail[u] 是 u 的最长真后缀状态（根为 0） */
   fail: Int32Array
   /** BFS 出队序（不含根）；失败链父节点必然排在子节点之前 */
@@ -301,7 +318,7 @@ export function buildAutomaton(patterns: readonly string[]): Automaton {
     }
   }
 
-  return { go, outLen, fail, order, terminal, nodeCount }
+  return { go, outLen, termLen: ownLen, fail, order, terminal, nodeCount }
 }
 
 export interface MaskResult {
@@ -311,11 +328,30 @@ export interface MaskResult {
   /** 至少有一个短语在此代码单元处结束的位置数（诊断用，不参与遮蔽） */
   endingCount: number
   /**
-   * 每条启用短语在原文中的完整匹配次数（区分大小写、允许自重叠、不跨换行），
-   * 顺序与 enabledPatterns 严格一致；零命中为 0。Uint32Array 上界 2^32-1，
-   * 而任一模式的命中数 ≤ |text| ≤ 2_000_000，绝不溢出。
+   * 每条启用短语的**有效命中次数**：完整匹配次数减去其被单次豁免掉的
+   * 命中数（区分大小写、允许自重叠、不跨换行），顺序与 enabledPatterns
+   * 严格一致；零命中为 0。Uint32Array 上界 2^32-1，而任一模式的命中数
+   * ≤ |text| ≤ 2_000_000，绝不溢出。
    */
   counts: Uint32Array
+  /**
+   * 每条启用短语在本次重算中实际生效（命中真实存在、同线内、完整）的
+   * 单次豁免数量，与 counts 同序；无豁免时为全 0。
+   */
+  exemptCounts: Uint32Array
+}
+
+/**
+ * 一次“单次豁免”的命中标识：只放过启用短语 k（enabledPatterns 下标）在
+ * 原文起始代码单元 start 处的**这一个**完整命中；同词的其他位置照常遮蔽。
+ * 调用方（session）负责校验“start 确为同线内的完整命中”；本层做防御性
+ * 过滤（不存在的命中对遮蔽没有任何影响）。
+ */
+export interface ExemptionHit {
+  /** 短语在启用短语序列（enabledPatterns）中的下标 */
+  pattern: number
+  /** 命中在原文中的起始 UTF-16 代码单元 */
+  start: number
 }
 
 const HASH = '#'.charCodeAt(0)
@@ -346,22 +382,95 @@ const CHUNK = 0x8000
  *   故逆序保证子（及其后缀）先汇入完毕。此后 arrive[terminal[k]] 恰为
  *   第 k 条短语的全部完整出现次数（包含自重叠；换行已把状态重置为根，
  *   故不跨换行）。全程只新增 O(节点数) 的定长整型数组，不为命中分配对象。
+ *
+ * 单次豁免（exemptions，数量有界：每条短语 ≤ 100、全局 ≤ 10,000）：
+ *   豁免只放过“短语 k 在 start 处这一个完整命中”，绝不放过同词其他位置，
+ *   也不抹掉其他短语在同一区域的遮蔽。实现不为全文命中建对象列表：
+ *   - 把豁免按其终点 end = start + |pattern_k| 排序（O(E log E)，E 有界），
+ *     正向扫描只在这些终点位置记下当时的扫描状态（O(E) 个定长整数）；
+ *   - 反向合并扫描到豁免终点 i 时，只对该点沿失败链枚举“恰好在此结束”
+ *     的匹配长度（自最长向最短，短语 ≤ 200，且总步数 ≤ Σ 豁免×200，
+ *     不随全文命中数增长），找出最长的“未被豁免”长度 L：L 即为该终点
+ *     此刻仍应生效的最长匹配，用它替换 mark[i] 后照常做区间合并。
+ *     被豁免命中里若有更短的未豁免后缀匹配，遮蔽自然保留；其他短语在同
+ *     一区域的命中终点不同，其 mark 不受影响，故嵌套 / 同终点 / 交叠 /
+ *     自重叠全部正确。
+ *   - 每条短语的有效命中次数 = 完整匹配次数 − 该条被豁免且真实存在的
+ *     命中数（exemptCounts 记录后者）。
  */
-export function maskText(text: string, enabledPatterns: readonly string[]): MaskResult {
+export function maskText(
+  text: string,
+  enabledPatterns: readonly string[],
+  exemptions?: readonly ExemptionHit[],
+): MaskResult {
   const n = text.length
-  const counts = new Uint32Array(enabledPatterns.length)
+  const m = enabledPatterns.length
+  const counts = new Uint32Array(m)
+  const exemptCounts = new Uint32Array(m)
 
-  if (enabledPatterns.length === 0 || n === 0) {
-    return { masked: text, coveredCount: 0, endingCount: 0, counts }
+  if (m === 0 || n === 0) {
+    return { masked: text, coveredCount: 0, endingCount: 0, counts, exemptCounts }
   }
 
-  const { go, outLen, fail, order, terminal, nodeCount } = buildAutomaton(enabledPatterns)
+  const { go, outLen, termLen, fail, order, terminal, nodeCount } = buildAutomaton(enabledPatterns)
   const mark = new Uint16Array(n)
   /** 到达次数：先只记“扫描直达”，再逆向汇入失败链 */
   const arrive = new Uint32Array(nodeCount)
 
+  // ---- 豁免清单：按终点排序；防御性过滤掉无意义项 ----
+  // 防御条件与 session 层的 addEntryExemption 完全一致：下标/起点整数且
+  // 不越界，且 text.substr(start) 与该启用短语逐代码单元相同——合法短语
+  // 不含换行，子串相等即保证命中完整且在同一行内（不可能跨换行）。
+  // exItem 与 exState 一一对应；同终点（闭区间终点 = start + len − 1，
+  // 即终止态被扫描到的位置）的豁免相邻成组。
+  const exItems: number[] = [] // 平铺 (pattern, start, endInclusive)，每项 3 槽位
+  if (exemptions && exemptions.length > 0) {
+    const seen = new Set<string>()
+    const valid: ExemptionHit[] = []
+    for (const h of exemptions) {
+      if (
+        !Number.isInteger(h.pattern) ||
+        h.pattern < 0 ||
+        h.pattern >= m ||
+        !Number.isInteger(h.start) ||
+        h.start < 0
+      ) {
+        continue
+      }
+      const p = enabledPatterns[h.pattern]
+      if (h.start + p.length > n) continue
+      let exact = true
+      for (let j = 0; j < p.length; j++) {
+        if (text.charCodeAt(h.start + j) !== p.charCodeAt(j)) {
+          exact = false
+          break
+        }
+      }
+      if (!exact) continue
+      // 字符串键：数字复合键在 |text| 达 2,000,000 时会越过安全整数上界
+      const key = `${h.pattern}:${h.start}`
+      if (seen.has(key)) continue // 同一命中重复豁免只算一次
+      seen.add(key)
+      valid.push(h)
+    }
+    valid.sort((a, b) => {
+      const ea = a.start + enabledPatterns[a.pattern].length - 1
+      const eb = b.start + enabledPatterns[b.pattern].length - 1
+      return ea - eb || a.pattern - b.pattern
+    })
+    for (const h of valid) {
+      exItems.push(h.pattern, h.start, h.start + enabledPatterns[h.pattern].length - 1)
+    }
+  }
+
+  // ---- 第一遍：正向扫描；仅在豁免终点记录消费该字符之后的扫描状态 ----
+  // 命中 [start, i] 在消费字符 i 之后到达终止态，因此状态必须在状态转移
+  // 之后记录。豁免终点不可能是换行（短语不含换行），故 NL 重置分支无需
+  // 处理豁免。
+  const exState = new Int32Array(exItems.length / 3)
   let state = 0
   let endingCount = 0
+  let xp = 0 // exItems 中当前待匹配终点的豁免下标（槽位起点为 xp*3）
   for (let i = 0; i < n; i++) {
     const c = text.charCodeAt(i)
     if (c === NL) {
@@ -373,6 +482,10 @@ export function maskText(text: string, enabledPatterns: readonly string[]): Mask
     const len = outLen[state]
     mark[i] = len
     if (len !== 0) endingCount++
+    while (xp < exState.length && exItems[xp * 3 + 2] === i) {
+      exState[xp] = state
+      xp++
+    }
   }
 
   // ---- 计数：按 BFS 序逆向，把到达次数汇入失败链父节点（每节点一次） ----
@@ -380,15 +493,53 @@ export function maskText(text: string, enabledPatterns: readonly string[]): Mask
     const u = order[k]
     arrive[fail[u]] += arrive[u]
   }
-  for (let k = 0; k < enabledPatterns.length; k++) {
-    counts[k] = arrive[terminal[k]]
-  }
 
-  // ---- 第二遍：覆盖并集 ----
+  // ---- 第二遍：覆盖并集；豁免终点用“最长未豁免匹配长度”替换标记 ----
+  // 豁免按终点升序排列，反向扫描时自末尾向前消费，同终点成组处理。
+  let xq = exState.length // 尚未消费的豁免条数（自末尾向前成组消费）
   const cover = new Uint8Array(n)
   let coveredCount = 0
   let reach = -1
   for (let i = n - 1; i >= 0; i--) {
+    if (xq > 0 && exItems[(xq - 1) * 3 + 2] === i) {
+      // 收集终点恰为 i 的整组豁免（组在排序后按 pattern 升序相邻）
+      let gBegin = xq // 组前界
+      while (gBegin > 0 && exItems[(gBegin - 1) * 3 + 2] === i) gBegin--
+      const gEnd = xq
+      // 该组的 (pattern → 起始) 列表；每组至多 100 条，线性即可
+      const startOf: number[] = []
+      for (let x = gBegin; x < gEnd; x++) startOf.push(exItems[x * 3], exItems[x * 3 + 1])
+      // 同终点全组共享扫描在 i 处的状态；沿失败链枚举“恰好在此结束”的
+      // 全部匹配长度（每个长度至多对应一个启用短语）。计数与“保留长度”
+      // 必须分开：即使最长匹配未被豁免（提前确定 longestKept），链上更
+      // 短的被豁免匹配仍要计入 exemptCounts，故计数走完整条链。
+      const uEnd = exState[gEnd - 1]
+      let longestKept = 0
+      let u = uEnd
+      while (u !== 0) {
+        const tl = termLen[u]
+        if (tl !== 0) {
+          const candStart = i - tl + 1
+          let foundK = -1
+          for (let s = 0; s < startOf.length; s += 2) {
+            if (startOf[s + 1] === candStart) {
+              foundK = startOf[s]
+              break
+            }
+          }
+          if (foundK === -1) {
+            // 未被豁免：自最长向最短遇到的第一个即该终点应保留的长度
+            if (longestKept === 0) longestKept = tl
+          } else {
+            // 该豁免命中真实存在（uEnd 的终止链即 i 处全部匹配）：生效一次
+            exemptCounts[foundK]++
+          }
+        }
+        u = fail[u]
+      }
+      mark[i] = longestKept
+      xq = gBegin
+    }
     const len = mark[i]
     if (len === 0) continue
     const start = i - len + 1
@@ -403,6 +554,11 @@ export function maskText(text: string, enabledPatterns: readonly string[]): Mask
     }
   }
 
+  // 豁免生效数在反向遍历时才确定：回填一次有效命中计数
+  for (let k = 0; k < m; k++) {
+    counts[k] = Math.max(0, arrive[terminal[k]] - exemptCounts[k])
+  }
+
   // ---- 生成结果：以 Uint16 分块 fromCharCode 避免巨型参数列表 ----
   const codes = new Uint16Array(n)
   for (let i = 0; i < n; i++) {
@@ -414,7 +570,7 @@ export function maskText(text: string, enabledPatterns: readonly string[]): Mask
     parts.push(String.fromCharCode.apply(null, slice as unknown as number[]))
   }
 
-  return { masked: parts.join(''), coveredCount, endingCount, counts }
+  return { masked: parts.join(''), coveredCount, endingCount, counts, exemptCounts }
 }
 
 // ---------------------------------------------------------------------------
