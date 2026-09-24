@@ -765,3 +765,263 @@ describe('自动机结构性质', () => {
     // 状态 ab 的最长链上词典 = 2（'ab'）；abc = 3
   })
 })
+
+// ---------------------------------------------------------------------------
+// 单次豁免（引文保留）：朴素预言机独立枚举每处命中，把被豁免的命中从
+// 覆盖与计数中剔除，再与 maskText 的输出逐字符、逐短语核对。
+// ---------------------------------------------------------------------------
+
+/** 豁免以“启用短语下标 + 起始代码单元”标识一处具体命中。 */
+interface ExHit {
+  pattern: number
+  start: number
+}
+
+/**
+ * 豁免预言机：与生产实现无关地 indexOf 枚举每条短语的全部完整命中
+ * （逐位置推进，允许自重叠、短语不含换行天然不跨行），跳过被豁免集合中的
+ * 命中，其余用区间差分求覆盖并集。
+ */
+function oracleWithExemptions(
+  text: string,
+  patterns: readonly string[],
+  exempt: ReadonlySet<string>,
+): { masked: string; coveredCount: number; counts: number[] } {
+  const delta = new Int32Array(text.length + 1)
+  const counts = new Array<number>(patterns.length).fill(0)
+  for (let k = 0; k < patterns.length; k++) {
+    const p = patterns[k]
+    let from = 0
+    for (;;) {
+      const idx = text.indexOf(p, from)
+      if (idx === -1) break
+      if (!exempt.has(`${k}:${idx}`)) {
+        delta[idx] += 1
+        delta[idx + p.length] -= 1
+        counts[k]++
+      }
+      from = idx + 1
+    }
+  }
+  let coveredCount = 0
+  let out = ''
+  let open = 0
+  for (let i = 0; i < text.length; i++) {
+    open += delta[i]
+    const on = open > 0
+    if (on) coveredCount++
+    out += on ? '#' : text[i]
+  }
+  return { masked: out, coveredCount, counts }
+}
+
+function exSet(hits: readonly ExHit[]): Set<string> {
+  return new Set(hits.map((h) => `${h.pattern}:${h.start}`))
+}
+
+/** 枚举全部命中（与豁免预言机同定义），供随机测试挑选有效豁免点。 */
+function enumerateHits(text: string, patterns: readonly string[]): ExHit[] {
+  const hits: ExHit[] = []
+  for (let k = 0; k < patterns.length; k++) {
+    const p = patterns[k]
+    let from = 0
+    for (;;) {
+      const idx = text.indexOf(p, from)
+      if (idx === -1) break
+      hits.push({ pattern: k, start: idx })
+      from = idx + 1
+    }
+  }
+  return hits
+}
+
+function expectMaskWithEx(
+  text: string,
+  patterns: readonly string[],
+  exempt: readonly ExHit[],
+) {
+  const refs = exempt.map((h) => ({ pattern: h.pattern, start: h.start }))
+  const result = maskText(text, patterns, refs)
+  const oracle = oracleWithExemptions(text, patterns, exSet(exempt))
+  expect(result.masked).toBe(oracle.masked)
+  expect(result.coveredCount).toBe(oracle.coveredCount)
+  expectCounts(result, oracle.counts)
+  return result
+}
+
+describe('单次豁免：朴素预言机一致性（随机性质测试）', () => {
+  it('随机文本 + 随机短语 + 随机豁免子集，覆盖并集与有效计数逐项一致', () => {
+    const rng = mulberry32(0xe8e8710)
+    for (let round = 0; round < 200; round++) {
+      const text = randomString(rng, 120)
+      const count = 1 + Math.floor(rng() * 12)
+      const patternSet = new Set<string>()
+      for (let i = 0; i < count; i++) patternSet.add(randomString(rng, 1 + Math.floor(rng() * 6)))
+      const patterns = [...patternSet]
+      const hits = enumerateHits(text, patterns)
+      // 随机豁免一个子集（含“豁免全部命中”这一极端）
+      const exempt = hits.filter(() => rng() < 0.4)
+      expectMaskWithEx(text, patterns, exempt)
+    }
+  })
+
+  it('含换行文本：行内命中可豁免，骑跨换行本就不是命中，其他行不受影响', () => {
+    const rng = mulberry32(0x11ee7)
+    for (let round = 0; round < 100; round++) {
+      const lines: string[] = []
+      for (let i = 0; i < 1 + Math.floor(rng() * 4); i++) lines.push(randomString(rng, 40))
+      const text = lines.join('\n')
+      const ps = new Set<string>()
+      for (let i = 0; i < 6; i++) ps.add(randomString(rng, 5))
+      const patterns = [...ps]
+      const hits = enumerateHits(text, patterns)
+      const exempt = hits.filter(() => rng() < 0.5)
+      const result = expectMaskWithEx(text, patterns, exempt)
+      // 换行永远原样保留
+      for (let i = 0; i < text.length; i++) {
+        if (text.charCodeAt(i) === 0x0a) expect(result.masked[i]).toBe('\n')
+      }
+    }
+  })
+
+  it('深嵌套 a^1..L：豁免若干层后，露出位置与预言机逐字符相同', () => {
+    const rng = mulberry32(0xaaa1)
+    for (let round = 0; round < 40; round++) {
+      const depth = 2 + Math.floor(rng() * 30)
+      const patterns: string[] = []
+      for (let L = 1; L <= depth; L++) patterns.push('a'.repeat(L))
+      const text = 'a'.repeat(depth * 3)
+      const hits = enumerateHits(text, patterns)
+      // 集中豁免在同一终点（同终点嵌套命中）与分散豁免各覆盖
+      const exempt = hits.filter(() => rng() < 0.3)
+      expectMaskWithEx(text, patterns, exempt)
+    }
+  })
+})
+
+describe('单次豁免：语义点名场景', () => {
+  it('只放过这一处：同词的其他命中仍遮蔽，计数只减一', () => {
+    const text = 'xxx xxx xxx'
+    const patterns = ['xxx']
+    // 豁免中间那处（start=4）
+    const result = expectMaskWithEx(text, patterns, [{ pattern: 0, start: 4 }])
+    expect(result.masked).toBe('### xxx ###')
+    expect(result.counts[0]).toBe(2) // 3 - 1
+    expect(result.coveredCount).toBe(6)
+  })
+
+  it('豁免一处不抹掉其他短语在同一区域的遮蔽', () => {
+    // 'abcdef'：'abc' 与 'bc' 都覆盖位置 1..2；豁免 'abc'（start=0）后，
+    // 位置 0 露出，但 1..2 仍被 'bc' 覆盖
+    expectMaskWithEx('abcdef', ['abc', 'bc'], [{ pattern: 0, start: 0 }])
+    // 反向：豁免短词 'bc'，长词 'abc' 仍全覆盖
+    expectMaskWithEx('abcdef', ['abc', 'bc'], [{ pattern: 1, start: 1 }])
+  })
+
+  it('同终点嵌套：豁免最长词后取次长匹配；全部豁免才露出', () => {
+    const text = 'abcd'
+    const patterns = ['a', 'ab', 'abc', 'abcd']
+    // 只豁免最长 'abcd'：终点 3 改取 'abc'，位置 3 露出
+    expectMaskWithEx(text, patterns, [{ pattern: 3, start: 0 }])
+    // 豁免 abcd 与 abc：取 'ab'
+    expectMaskWithEx(text, patterns, [
+      { pattern: 3, start: 0 },
+      { pattern: 2, start: 0 },
+    ])
+    // 同终点四个词全部豁免：整个区间露出，计数各减一
+    const result = expectMaskWithEx(
+      text,
+      patterns,
+      [0, 1, 2, 3].map((k) => ({ pattern: k, start: 0 })),
+    )
+    expect(result.masked).toBe('abcd')
+    expect(result.coveredCount).toBe(0)
+    expect([...result.counts]).toEqual([0, 0, 0, 0])
+  })
+
+  it('自重叠：豁免其中一处重叠命中，其余重叠照常', () => {
+    const text = 'aaaa'
+    // 'aa' 命中 start 0,1,2；豁免 start=1，剩 0 与 2 覆盖 {0,1}∪{2,3}=全覆盖，
+    // 故遮蔽不变但计数 3→2
+    const result = expectMaskWithEx(text, ['aa'], [{ pattern: 0, start: 1 }])
+    expect(result.masked).toBe('####')
+    expect(result.counts[0]).toBe(2)
+    // 豁免 start=0：只剩 {1,2} 与 {2,3} → 位置 0 露出
+    expectMaskWithEx(text, ['aa'], [{ pattern: 0, start: 0 }])
+  })
+
+  it('不同词在同终点结束：豁免其一，另一词继续覆盖', () => {
+    // 'zabc'：'abc'(1..3) 与 'bc'(2..3) 同终点 3。
+    const text = 'zabc'
+    const patterns = ['abc', 'bc']
+    // 豁免 'abc'（start=1）：'bc' 仍盖 2..3，位置 1 的 'a' 露出
+    const r1 = expectMaskWithEx(text, patterns, [{ pattern: 0, start: 1 }])
+    expect(r1.masked).toBe('za##')
+    // 豁免 'bc'（start=2）：'abc' 仍盖 1..3
+    const r2 = expectMaskWithEx(text, patterns, [{ pattern: 1, start: 2 }])
+    expect(r2.masked).toBe('z###')
+  })
+
+  it('豁免后计数与遮蔽来自同一工作集：零有效命中显示 0', () => {
+    const text = 'abc'
+    const result = maskText(text, ['abc'], [{ pattern: 0, start: 0 }])
+    expect(result.counts[0]).toBe(0)
+    expect(result.masked).toBe('abc')
+    // 诊断计数：该终点所有匹配被豁免，endingCount 为 0
+    expect(result.endingCount).toBe(0)
+  })
+
+  it('每个豁免引用扣一次（去重契约在会话层 toExemptionRefs）', () => {
+    // maskText 按引用计数：同一命中传入两个引用会扣两次。会话层保证不会
+    // 重复登记（addExemption 拒绝重复、toExemptionRefs 再按集合去重），
+    // 这里锁定底层语义，避免两层之间产生“扣几次”的歧义。
+    const text = 'abcabc'
+    const once = maskText(text, ['abc'], [{ pattern: 0, start: 0 }])
+    const twice = maskText(
+      text,
+      ['abc'],
+      [
+        { pattern: 0, start: 0 },
+        { pattern: 0, start: 0 },
+      ],
+    )
+    expect(once.counts[0]).toBe(1)
+    expect(twice.counts[0]).toBe(0)
+    // 遮蔽预言机只把“该命中是否仍覆盖”视为布尔：扣两次也只露出这一处
+    expect(twice.masked).toBe(oracleWithExemptions(text, ['abc'], exSet([{ pattern: 0, start: 0 }])).masked)
+  })
+})
+
+describe('单次豁免：密集命中性能（不为全文命中建立对象列表）', () => {
+  it('满规模 a 游程 + a^1..200：登记 1000 处豁免仍在时限内，计数 n-L+1-豁免数', () => {
+    const n = LIMITS.maxTextCodeUnits
+    const text = 'a'.repeat(n)
+    const patterns: string[] = []
+    for (let L = 1; L <= 200; L++) patterns.push('a'.repeat(L))
+    // 对 a^200 豁免前 1000 个不同起点（同终点分布在 1000 个终点）
+    const exempt: ExHit[] = []
+    for (let s = 0; s < 1000; s++) exempt.push({ pattern: 199, start: s })
+    const refs = exempt.map((h) => ({ pattern: h.pattern, start: h.start }))
+    const t0 = Date.now()
+    const result = maskText(text, patterns, refs)
+    expect(Date.now() - t0).toBeLessThan(3000)
+    // 全覆盖依旧（每处仍有 a^199 等其他词覆盖）
+    expect(result.coveredCount).toBe(n)
+    // a^200 的有效命中减少 1000；其余不变
+    expect(result.counts[199]).toBe(n - 200 + 1 - 1000)
+    expect(result.counts[0]).toBe(n) // a^1 未豁免
+  })
+
+  it('全部豁免集中于同一终点（同终点 200 层嵌套）：失败链行走正确且不按命中数展开', () => {
+    const text = 'a'.repeat(5000)
+    const patterns: string[] = []
+    for (let L = 1; L <= 200; L++) patterns.push('a'.repeat(L))
+    // 在终点 4999 豁免所有 200 层：该位置露出到 200 长度以外
+    const end = 4999
+    const exempt: ExHit[] = []
+    for (let k = 0; k < patterns.length; k++) {
+      exempt.push({ pattern: k, start: end - patterns[k].length + 1 })
+    }
+    expectMaskWithEx(text, patterns, exempt)
+  })
+})

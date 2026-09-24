@@ -17,6 +17,15 @@
  * 到达状态次数，再按构建顺序逆向汇入失败链父节点，最后从模式终止节点取数，
  * 不遍历输出链、不逐短语重扫；资源消耗只随 |text|、trie 节点数与模式数
  * 线性增长，不为命中分配任何对象。
+ *
+ * 单次豁免（引文保留）：调用方可以为个别**完整命中**登记一次性豁免。豁免
+ * 引用某条启用短语在原文中的起始代码单元（同一行内的完整命中），只放过这
+ * 一处命中：该命中区间不再贡献遮蔽（但其他短语在同一区域的遮蔽保留），该
+ * 短语的“有效命中次数”也只减这一处；同词的其他命中照常遮蔽与计数。豁免
+ * 数量有硬上限（LIMITS.maxExemptions），因此其额外开销只随豁免数 × 最大
+ * 短语长（≤ 200）增长，与全文命中总数无关：不会为全文命中建立任何对象
+ * 列表，只在豁免命中的终点处沿失败链行走（≤ 200 步）求“到此结束的最长
+ * 非豁免匹配”。
  */
 
 export const LIMITS = {
@@ -30,6 +39,13 @@ export const LIMITS = {
   maxPatternLength: 200,
   /** 全部短语长度总和不超过三十万 */
   maxTotalPatternLength: 300_000,
+  /**
+   * 单次豁免（引文保留）的总会话硬上限。豁免是逐条人工操作，数量保持很小；
+   * 有了这道上界，豁免相关的额外工作（终点集合、按终点失败链行走）只随
+   * 豁免数 × 最大短语长（≤ 200）增长，绝不随全文命中数增长，也不可能被
+   * 用来登记全文每一处命中而退化。
+   */
+  maxExemptions: 1_000,
 } as const
 
 export const INVALID_INPUT = 'INVALID_INPUT'
@@ -42,6 +58,12 @@ export const COUNT_FAILED = 'COUNT_FAILED'
  * 绝不提交快照。数量低于最小数量（删除唯一短语）同样用本错误码。
  */
 export const LIMITS_EXCEEDED = 'LIMITS_EXCEEDED'
+/**
+ * 单次豁免引用无效：位置不是整数 / 越界 / 落在换行上 / 引用的短语停用或
+ * 下标越界 / 该位置不是这条短语在同一行内的完整命中 / 对同一命中重复豁免。
+ * 与其他编辑错误一样发生在重算之前：不提交快照，保留上次有效预览与采纳稿。
+ */
+export const INVALID_EXEMPTION = 'INVALID_EXEMPTION'
 
 export class MaskError extends Error {
   readonly code:
@@ -49,12 +71,14 @@ export class MaskError extends Error {
     | typeof INVALID_PATTERN
     | typeof COUNT_FAILED
     | typeof LIMITS_EXCEEDED
+    | typeof INVALID_EXEMPTION
   constructor(
     code:
       | typeof INVALID_INPUT
       | typeof INVALID_PATTERN
       | typeof COUNT_FAILED
-      | typeof LIMITS_EXCEEDED,
+      | typeof LIMITS_EXCEEDED
+      | typeof INVALID_EXEMPTION,
   ) {
     super(code)
     this.name = 'MaskError'
@@ -213,6 +237,12 @@ interface Automaton {
   go: (state: number, charCode: number) => number
   /** 该状态沿失败链可达的最长字典词长度，0 表示无匹配（≤ 200） */
   outLen: Uint16Array
+  /**
+   * 本状态自身终止的字典词长度，0 表示本节点不是任何模式终点。
+   * 豁免处理沿失败链识别“到此结束的匹配”时需要它（outLen 只给最长值，
+   * 无法区分被豁免后剩余的次长匹配）。
+   */
+  ownLen: Uint16Array
   /** 失败链：fail[u] 是 u 的最长真后缀状态（根为 0） */
   fail: Int32Array
   /** BFS 出队序（不含根）；失败链父节点必然排在子节点之前 */
@@ -301,21 +331,37 @@ export function buildAutomaton(patterns: readonly string[]): Automaton {
     }
   }
 
-  return { go, outLen, fail, order, terminal, nodeCount }
+  return { go, outLen, ownLen, fail, order, terminal, nodeCount }
 }
 
 export interface MaskResult {
   masked: string
-  /** 被遮蔽的代码单元数（覆盖并集大小，不是命中次数） */
+  /**
+   * 被遮蔽的代码单元数（覆盖并集大小，不是命中次数）。豁免命中独占的
+   * 代码单元不计入；被其他启用短语（含其他命中）覆盖的位置仍计入。
+   */
   coveredCount: number
-  /** 至少有一个短语在此代码单元处结束的位置数（诊断用，不参与遮蔽） */
+  /** 至少有一个**未被豁免**的短语在此代码单元处结束的位置数（诊断用） */
   endingCount: number
   /**
-   * 每条启用短语在原文中的完整匹配次数（区分大小写、允许自重叠、不跨换行），
-   * 顺序与 enabledPatterns 严格一致；零命中为 0。Uint32Array 上界 2^32-1，
-   * 而任一模式的命中数 ≤ |text| ≤ 2_000_000，绝不溢出。
+   * 每条启用短语在原文中的**有效**完整匹配次数（区分大小写、允许自重叠、
+   * 不跨换行），顺序与 enabledPatterns 严格一致；等于总命中次数减去针对
+   * 该短语登记的豁免数（每处豁免只减一处命中），零命中为 0。Uint32Array
+   * 上界 2^32-1，而任一模式的命中数 ≤ |text| ≤ 2_000_000，绝不溢出。
    */
   counts: Uint32Array
+}
+
+/**
+ * 对一处具体命中的单次豁免引用（“只放过这一处”）：
+ * pattern 是该短语在**启用短语序列**中的下标（与 enabledPatterns 同序），
+ * start 是该命中在原文中的起始 UTF-16 代码单元。会话层负责校验它确为该
+ * 短语在同一行内的完整命中；这里只按引用扣除。引用必须有效（越界、停用
+ * 短语等由会话层在重算之前拒绝）。
+ */
+export interface ExemptionRef {
+  pattern: number
+  start: number
 }
 
 const HASH = '#'.charCodeAt(0)
@@ -324,7 +370,7 @@ const NL = 0x0a
 const CHUNK = 0x8000
 
 /**
- * 从原文与当前启用的短语重算遮蔽结果与每条短语的完整匹配次数。
+ * 从原文与当前启用的短语重算遮蔽结果与每条短语的有效完整匹配次数。
  *
  * 遮蔽（线性两遍法，额外内存 O(|text|)，不按命中数展开）：
  *   第一遍正向扫描 AC 自动机，在每个代码单元末尾记录“覆盖该位置的
@@ -339,15 +385,30 @@ const CHUNK = 0x8000
  *     - 被包含：什么也不做。
  *   每个位置至多被写入一次，整段仍是 O(n)。
  *
+ * 豁免（不为全文命中建立对象列表，额外工作只随豁免数 × ≤200 增长）：
+ *   豁免只可能改变“恰好有豁免命中结束”的终点。在这些终点 i，第一遍额外
+ *   沿当前状态的失败链下行，跳过所有“恰在此处结束且被豁免”的匹配长度，
+ *   取第一个未被豁免的终止词长度，写入 exMark[i]（mark[i] 仍保留全部
+ *   匹配的最长值）；覆盖并集第二遍在普通终点用 mark[i]、在豁免终点用
+ *   exMark[i]。这样被豁免命中**独占**的位置露出原文，而其他短语（或同一
+ *   短语的其他命中、嵌套/同终点命中）在同一区域造成的遮蔽全部保留。
+ * *   非豁免终点不做任何失败链行走，因此无豁免时扫描期不增加任何计算
+ *   （仅多一个与 mark 同阶的定长整型数组，与既有 cover/codes 数组同量级）。
+ *
  * 计数（与遮蔽同一遍扫描产出，逐短语 O(1) 取数，不逐短语重扫）：
  *   arrive[u] 只累计扫描过程中“到达状态 u”的次数，沿失败链完成的匹配
  *   不在此行走输出链。扫描结束后按构建顺序（BFS 序）逆向遍历，把每个
  *   状态的到达次数一次性汇入其失败链父节点：fail 父在 BFS 序中必早于子，
  *   故逆序保证子（及其后缀）先汇入完毕。此后 arrive[terminal[k]] 恰为
  *   第 k 条短语的全部完整出现次数（包含自重叠；换行已把状态重置为根，
- *   故不跨换行）。全程只新增 O(节点数) 的定长整型数组，不为命中分配对象。
+ *   故不跨换行），再减去针对该短语登记的豁免数即“有效命中次数”。全程只
+ *   新增 O(节点数) 的定长整型数组，不为命中分配对象。
  */
-export function maskText(text: string, enabledPatterns: readonly string[]): MaskResult {
+export function maskText(
+  text: string,
+  enabledPatterns: readonly string[],
+  exemptions: readonly ExemptionRef[] = [],
+): MaskResult {
   const n = text.length
   const counts = new Uint32Array(enabledPatterns.length)
 
@@ -355,13 +416,42 @@ export function maskText(text: string, enabledPatterns: readonly string[]): Mask
     return { masked: text, coveredCount: 0, endingCount: 0, counts }
   }
 
-  const { go, outLen, fail, order, terminal, nodeCount } = buildAutomaton(enabledPatterns)
+  const { go, outLen, ownLen, fail, order, terminal, nodeCount } = buildAutomaton(enabledPatterns)
   const mark = new Uint16Array(n)
   /** 到达次数：先只记“扫描直达”，再逆向汇入失败链 */
   const arrive = new Uint32Array(nodeCount)
 
+  // ---- 豁免索引：按“命中终点 = start + 短语长 - 1”组织，仅在这些终点行走失败链 ----
+  // exEnds 升序、exLens 为对应命中长度（同终点可有多个：自重叠 / 嵌套 / 同终点
+  // 命中各自一条）。exByPattern 累计每短语的豁免数，计数阶段逐条扣减。
+  // 豁免总数 ≤ LIMITS.maxExemptions：这里的排序与集合开销与全文命中数无关。
+  const exCount = exemptions.length
+  const exEnds = new Int32Array(exCount)
+  const exLens = new Uint16Array(exCount)
+  const exByPattern = new Uint32Array(enabledPatterns.length)
+  const sorted =
+    exCount <= 1
+      ? exemptions
+      : Array.from(exemptions).sort((a, b) => {
+          const ea = a.start + enabledPatterns[a.pattern].length
+          const eb = b.start + enabledPatterns[b.pattern].length
+          return ea - eb
+        })
+  for (let t = 0; t < exCount; t++) {
+    const ref = sorted[t]
+    const lenP = enabledPatterns[ref.pattern].length
+    exEnds[t] = ref.start + lenP - 1
+    exLens[t] = lenP
+    exByPattern[ref.pattern]++
+  }
+
   let state = 0
   let endingCount = 0
+  /** exMark：仅在豁免终点写入“到此结束的最长非豁免匹配长度”（0 = 全被豁免） */
+  const exMark = new Uint16Array(n)
+  /** 下一个尚未消费的豁免终点（exEnds 升序，随 i 单调前移） */
+  let exCursor = 0
+
   for (let i = 0; i < n; i++) {
     const c = text.charCodeAt(i)
     if (c === NL) {
@@ -373,6 +463,30 @@ export function maskText(text: string, enabledPatterns: readonly string[]): Mask
     const len = outLen[state]
     mark[i] = len
     if (len !== 0) endingCount++
+
+    // 该终点有豁免命中：收集在此结束的被豁免匹配长度，再沿失败链找最长的
+    // “未被豁免”的终止词。失败链自上而下（终止词由长到短），第一个未跳过
+    // 的终止状态即最长非豁免匹配；走到根（chosen=0）表示全部被豁免。
+    if (exCursor < exCount && exEnds[exCursor] === i) {
+      const skipped = new Set<number>()
+      while (exCursor < exCount && exEnds[exCursor] === i) {
+        skipped.add(exLens[exCursor])
+        exCursor++
+      }
+      let u = state
+      let chosen = 0
+      while (u !== 0) {
+        const ol = ownLen[u]
+        if (ol !== 0 && !skipped.has(ol)) {
+          chosen = ol
+          break
+        }
+        u = fail[u]
+      }
+      exMark[i] = chosen
+      // 该终点的所有匹配都被豁免：不计入“有未豁免短语结束”的诊断计数
+      if (chosen === 0) endingCount--
+    }
   }
 
   // ---- 计数：按 BFS 序逆向，把到达次数汇入失败链父节点（每节点一次） ----
@@ -381,20 +495,26 @@ export function maskText(text: string, enabledPatterns: readonly string[]): Mask
     arrive[fail[u]] += arrive[u]
   }
   for (let k = 0; k < enabledPatterns.length; k++) {
-    counts[k] = arrive[terminal[k]]
+    // 有效命中 = 全部完整出现 − 针对本短语的豁免（每处豁免只放过一处命中）
+    counts[k] = arrive[terminal[k]] - exByPattern[k]
   }
 
-  // ---- 第二遍：覆盖并集 ----
+  // ---- 第二遍：覆盖并集；豁免终点改用“最长非豁免匹配” ----
+  // exEnds 升序：倒序扫描时用游标 ec 单调前移，O(n + 豁免数) 即可识别
+  // 豁免终点，不需要按 |text| 的终点位图。
   const cover = new Uint8Array(n)
   let coveredCount = 0
   let reach = -1
+  let ec = exCount - 1
   for (let i = n - 1; i >= 0; i--) {
-    const len = mark[i]
-    if (len === 0) continue
-    const start = i - len + 1
+    while (ec >= 0 && exEnds[ec] > i) ec--
+    const isExEnd = ec >= 0 && exEnds[ec] === i
+    const activeLen = isExEnd ? exMark[i] : mark[i]
+    if (activeLen === 0) continue
+    const start = i - activeLen + 1
     if (reach === -1 || i < reach) {
       for (let j = start; j <= i; j++) cover[j] = 1
-      coveredCount += len
+      coveredCount += activeLen
       reach = start
     } else if (start < reach) {
       for (let j = start; j < reach; j++) cover[j] = 1

@@ -16,6 +16,7 @@ import {
   COUNT_FAILED,
   INVALID_INPUT,
   INVALID_PATTERN,
+  INVALID_EXEMPTION,
   LIMITS,
   LIMITS_EXCEEDED,
   MaskError,
@@ -23,16 +24,21 @@ import {
   type PatternEntry,
 } from './masker'
 import {
-  adopt,
+  addExemption,
   addPattern,
+  adopt,
   applyChange,
   countByEntry,
+  exemptionsByEntry,
   loadSession,
   recompute,
   removePattern,
   rollback,
+  sameExemptions,
   setPatternEnabled,
+  toExemptionRefs,
   updatePattern,
+  type Exemption,
   type Snapshot,
 } from './session'
 import { filterEntries } from './patternList'
@@ -281,37 +287,94 @@ function totalLen(entries: readonly PatternEntry[]): number {
   return entries.reduce((s, e) => s + e.value.length, 0)
 }
 
-/** 与生产实现无关的遮蔽预言机：indexOf 枚举 + 区间覆盖。 */
-function oracleMask(text: string, patterns: readonly string[]): string {
+/**
+ * 与生产实现无关的遮蔽预言机：indexOf 枚举 + 区间覆盖；可纳入单次豁免
+ * （工作集下标 + 起点的集合），被豁免命中从覆盖与计数中剔除。
+ */
+function oracleMask(
+  text: string,
+  patterns: readonly string[],
+  exemptKeys: ReadonlySet<string> = new Set(),
+  exemptByEnabled: ReadonlyMap<number, number> = new Map(),
+): string {
   const cover = new Uint8Array(text.length)
-  for (const p of patterns) {
+  for (let k = 0; k < patterns.length; k++) {
+    const p = patterns[k]
     let from = 0
     for (;;) {
       const idx = text.indexOf(p, from)
       if (idx === -1) break
-      for (let j = idx; j < idx + p.length; j++) cover[j] = 1
+      if (!exemptKeys.has(`${k}:${idx}`)) {
+        for (let j = idx; j < idx + p.length; j++) cover[j] = 1
+      }
       from = idx + 1
     }
   }
   let out = ''
   for (let i = 0; i < text.length; i++) out += cover[i] ? '#' : text[i]
+  void exemptByEnabled
   return out
+}
+
+/** 把工作集下标的豁免翻译成启用序列下标的键集合（与会话实现独立）。 */
+function enabledExemptionKeys(
+  entries: readonly PatternEntry[],
+  exemptions: readonly Exemption[],
+): { keys: Set<string>; enabled: string[] } {
+  const keys = new Set<string>()
+  const enabled: string[] = []
+  const enabledIndex = new Map<number, number>()
+  for (let i = 0; i < entries.length; i++) {
+    if (entries[i].enabled) {
+      enabledIndex.set(i, enabled.length)
+      enabled.push(entries[i].value)
+    }
+  }
+  for (const ex of exemptions) {
+    const k = enabledIndex.get(ex.entry)
+    if (k !== undefined) keys.add(`${k}:${ex.start}`)
+  }
+  return { keys, enabled }
 }
 
 /**
  * 四类快照成套一致：
- * 1) 列表（值与启停）；2) 计数映射；3) 工作预览（对照独立预言机）；
- * 4) 已采纳稿（内容与采纳时短语快照）。拒绝后应与保留快照逐项相同。
+ * 1) 列表（值与启停）；2) 计数映射；3) 工作预览（对照独立预言机，含豁免）；
+ * 4) 已采纳稿（内容与采纳时短语 / 豁免快照）。拒绝后应与保留快照逐项相同。
  */
 function expectCoherent(snapshot: Snapshot, draft: ReturnType<typeof adopt> | null) {
-  const enabled = snapshot.entries.filter((e) => e.enabled).map((e) => e.value)
-  expect(snapshot.result.masked).toBe(oracleMask(snapshot.text, enabled))
+  const { keys, enabled } = enabledExemptionKeys(snapshot.entries, snapshot.exemptions)
+  expect(snapshot.result.masked).toBe(oracleMask(snapshot.text, enabled, keys))
   expect(snapshot.result.masked).toHaveLength(snapshot.text.length)
   const mapped = countByEntry(snapshot.entries, snapshot.result)
   expect(mapped).toHaveLength(snapshot.entries.length)
+  // 独立预言机的逐短语有效计数（总命中 − 该启用短语的豁免数）
+  const exPerEnabled = new Map<number, number>()
+  {
+    let ki = 0
+    const emap = new Map<number, number>()
+    for (let i = 0; i < snapshot.entries.length; i++) {
+      if (snapshot.entries[i].enabled) emap.set(i, ki++)
+    }
+    for (const ex of snapshot.exemptions) {
+      const k = emap.get(ex.entry)
+      if (k !== undefined) exPerEnabled.set(k, (exPerEnabled.get(k) ?? 0) + 1)
+    }
+  }
   let k = 0
   for (let i = 0; i < snapshot.entries.length; i++) {
     if (snapshot.entries[i].enabled) {
+      // 用全文 indexOf 独立算总命中，再减豁免数
+      const p = snapshot.entries[i].value
+      let total = 0
+      let from = 0
+      for (;;) {
+        const idx = snapshot.text.indexOf(p, from)
+        if (idx === -1) break
+        total++
+        from = idx + 1
+      }
+      expect(snapshot.result.counts[k]).toBe(total - (exPerEnabled.get(k) ?? 0))
       expect(snapshot.result.counts[k]).toBe(mapped[i])
       k++
     } else {
@@ -319,14 +382,24 @@ function expectCoherent(snapshot: Snapshot, draft: ReturnType<typeof adopt> | nu
     }
   }
   expect(k).toBe(snapshot.result.counts.length)
+  // 豁免只引用存在且启用的工作集下标，且互不重复
+  const exSeen = new Set<string>()
+  for (const ex of snapshot.exemptions) {
+    expect(Number.isInteger(ex.entry) && ex.entry >= 0 && ex.entry < snapshot.entries.length).toBe(true)
+    expect(snapshot.entries[ex.entry].enabled).toBe(true)
+    const key = `${ex.entry}:${ex.start}`
+    expect(exSeen.has(key)).toBe(false)
+    exSeen.add(key)
+  }
+  expect(snapshot.exemptions.length).toBeLessThanOrEqual(LIMITS.maxExemptions)
   // 工作集自身始终满足输入契约（可被原样重新载入）
   expect(snapshot.entries.length).toBeGreaterThanOrEqual(LIMITS.minPatterns)
   expect(snapshot.entries.length).toBeLessThanOrEqual(LIMITS.maxPatterns)
   expect(totalLen(snapshot.entries)).toBeLessThanOrEqual(LIMITS.maxTotalPatternLength)
   if (draft) {
-    // 采纳稿是当时工作集对原文重算的遮蔽串；与其短语快照自洽
-    const draftEnabled = draft.entries.filter((e) => e.enabled).map((e) => e.value)
-    expect(draft.masked).toBe(oracleMask(snapshot.text, draftEnabled))
+    // 采纳稿是当时工作集 + 当时豁免对原文重算的遮蔽串
+    const { keys: dKeys, enabled: dEnabled } = enabledExemptionKeys(draft.entries, draft.exemptions)
+    expect(draft.masked).toBe(oracleMask(snapshot.text, dEnabled, dKeys))
   }
 }
 
@@ -565,5 +638,310 @@ describe('重算故障与越界的交错', () => {
     const next = applyChange(snapshot, (es) => [...es, { value: 'aa', enabled: false }])
     expect(next.entries).toHaveLength(2)
     expectCoherent(next, null)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// 单次豁免（引文保留）：登记 / 校验 / 计数与遮蔽成套重算 / 改停用删清理 /
+// 采纳固化 / 放弃回滚 / 故障保留。
+// ---------------------------------------------------------------------------
+describe('单次豁免：登记与重算', () => {
+  it('登记一处有效命中：只放过这一处，同词其他命中与其他短语遮蔽保留', () => {
+    const { snapshot } = load('xxx xxx xxx', ['xxx'])
+    expect(snapshot.exemptions).toEqual([])
+    const ex = addExemption(snapshot, 0, 4) // 中间那处
+    expect(ex.exemptions).toEqual([{ entry: 0, start: 4 }])
+    expect(ex.result.masked).toBe('### xxx ###')
+    expect(ex.result.coveredCount).toBe(6)
+    expect(ex.result.counts[0]).toBe(2) // 3 - 1
+    expectCoherent(ex, null)
+    // 原快照不被修改
+    expect(snapshot.exemptions).toEqual([])
+    expect(snapshot.result.masked).toBe('### ### ###')
+  })
+
+  it('豁免后“该短语有效命中次数”只减豁免数；豁免数可到命中总数', () => {
+    const { snapshot } = load('aaaa', ['aa']) // 命中 0,1,2 共 3 次
+    let s = addExemption(snapshot, 0, 0)
+    s = addExemption(s, 0, 1)
+    expect(s.result.counts[0]).toBe(1)
+    s = addExemption(s, 0, 2)
+    expect(s.result.counts[0]).toBe(0)
+    // 全部豁免：无覆盖
+    expect(s.result.masked).toBe('aaaa')
+    expect(s.result.coveredCount).toBe(0)
+    expectCoherent(s, null)
+  })
+
+  it('豁免不抹掉其他短语在同一区域的遮蔽（嵌套 / 交叠）', () => {
+    const { snapshot } = load('abcdef', ['abc', 'bc'])
+    const ex = addExemption(snapshot, 0, 0) // 豁免 'abc'
+    // 'bc' 仍覆盖位置 1..2
+    expect(ex.result.masked).toBe('a##def')
+    expect(ex.result.counts[0]).toBe(0) // abc 唯一命中被豁免
+    expect(ex.result.counts[1]).toBe(1) // bc 计数不受影响
+    expectCoherent(ex, null)
+  })
+})
+
+describe('单次豁免：无效位置一律 INVALID_EXEMPTION 且不重算', () => {
+  function loadBase() {
+    return load('abc abc\nabc', ['abc'])
+  }
+
+  it('非整数 / 越界下标 / 负数起点 / 非命中位置', () => {
+    const { snapshot } = loadBase()
+    expectError(INVALID_EXEMPTION, () => addExemption(snapshot, 0, -1))
+    expectError(INVALID_EXEMPTION, () => addExemption(snapshot, 0, 11))
+    expectError(INVALID_EXEMPTION, () => addExemption(snapshot, 0, 100))
+    expectError(INVALID_EXEMPTION, () => addExemption(snapshot, 0, 1.5))
+    expectError(INVALID_EXEMPTION, () => addExemption(snapshot, 0, NaN))
+    // 文本中有 'abc' 出现，但位置 1 不是起始完整命中（中间字符）
+    expectError(INVALID_EXEMPTION, () => addExemption(snapshot, 0, 1))
+    // 起区间越过文本末尾（start=8 处 'abc' 到 10，合法；start=9 则越界）
+    expectError(INVALID_EXEMPTION, () => addExemption(snapshot, 0, 9))
+    // 条目下标越界
+    expectError(INVALID_EXEMPTION, () => addExemption(snapshot, 5, 0))
+    expectError(INVALID_EXEMPTION, () => addExemption(snapshot, -1, 0))
+  })
+
+  it('骑跨换行的起点与区间：短语不含换行，出现换行即非同一行完整命中', () => {
+    const { snapshot } = loadBase() // 'abc abc\nabc'，换行在位置 7
+    // 换行位置本身不能作为起点
+    expectError(INVALID_EXEMPTION, () => addExemption(snapshot, 0, 7))
+    // 位置 8 是第二行行首的真实命中，合法
+    const ok = addExemption(snapshot, 0, 8)
+    expect(ok.exemptions).toEqual([{ entry: 0, start: 8 }])
+  })
+
+  it('停用条目不能豁免；重新启用后才可', () => {
+    const { snapshot } = loadBase()
+    const off = setPatternEnabled(snapshot, 0, false)
+    expectError(INVALID_EXEMPTION, () => addExemption(off, 0, 0))
+    const on = setPatternEnabled(off, 0, true)
+    expect(() => addExemption(on, 0, 0)).not.toThrow()
+  })
+
+  it('同一命中重复豁免 → INVALID_EXEMPTION', () => {
+    const { snapshot } = loadBase()
+    const once = addExemption(snapshot, 0, 0)
+    expectError(INVALID_EXEMPTION, () => addExemption(once, 0, 0))
+    // 同词的另一处命中仍可豁免
+    expect(() => addExemption(once, 0, 4)).not.toThrow()
+  })
+
+  it('无效豁免不触发重算：maskText 调用数不增加，旧快照保留', () => {
+    const { snapshot } = loadBase()
+    const calls = mockedMaskText.mock.calls.length
+    expectError(INVALID_EXEMPTION, () => addExemption(snapshot, 0, 1))
+    expectError(INVALID_EXEMPTION, () => addExemption(snapshot, 0, -1))
+    expectError(INVALID_EXEMPTION, () => addExemption(snapshot, 5, 0))
+    expect(mockedMaskText.mock.calls.length).toBe(calls)
+    expect(snapshot.exemptions).toEqual([])
+  })
+})
+
+describe('单次豁免：总数硬上限', () => {
+  it('达到 LIMITS.maxExemptions 后再登记 → LIMITS_EXCEEDED，旧快照保留', () => {
+    // 文本为足够多的 'a'，短语 'a' 在每个位置命中；豁免按起点计数
+    const n = LIMITS.maxExemptions + 10
+    const { snapshot } = loadSession(file('a'.repeat(n), ['a']))
+    let s = snapshot
+    for (let i = 0; i < LIMITS.maxExemptions; i++) s = addExemption(s, 0, i)
+    expect(s.exemptions).toHaveLength(LIMITS.maxExemptions)
+    expectCoherent(s, null)
+    expectError(LIMITS_EXCEEDED, () => addExemption(s, 0, LIMITS.maxExemptions))
+    // 被拒后数量不变
+    expect(s.exemptions).toHaveLength(LIMITS.maxExemptions)
+  })
+})
+
+describe('单次豁免：随短语修改 / 停用 / 删除清理与下标迁移', () => {
+  it('修改短语值：该条豁免被清理（新短语不继承），其他条豁免保留', () => {
+    const { snapshot } = load('abcXabc', ['abc', 'X'])
+    const withEx = addExemption(snapshot, 0, 4) // 豁免第二处 abc
+    const updated = updatePattern(withEx, 0, 'abcx') // 改值（文本中零命中）
+    expect(updated.exemptions).toEqual([])
+    expect(updated.result.counts[0]).toBe(0)
+    expectCoherent(updated, null)
+
+    // 其他条豁免保留：给 X 加豁免，再改第 0 条
+    const withTwo = addExemption(addExemption(snapshot, 0, 0), 1, 3)
+    expect(withTwo.exemptions).toHaveLength(2)
+    const upd = updatePattern(withTwo, 0, 'zzz')
+    expect(upd.exemptions).toEqual([{ entry: 1, start: 3 }])
+    expectCoherent(upd, null)
+  })
+
+  it('停用清理该条豁免；重新启用不恢复；其他条豁免与下标不动', () => {
+    const { snapshot } = load('abcdef', ['abc', 'def'])
+    let s = addExemption(snapshot, 0, 0)
+    s = addExemption(s, 1, 3)
+    expect(s.exemptions).toHaveLength(2)
+    const off = setPatternEnabled(s, 0, false)
+    expect(off.exemptions).toEqual([{ entry: 1, start: 3 }])
+    expectCoherent(off, null)
+    // 重新启用不恢复豁免
+    const on = setPatternEnabled(off, 0, true)
+    expect(on.exemptions).toEqual([{ entry: 1, start: 3 }])
+    expectCoherent(on, null)
+    // 停用另一条（下标 1）则其豁免也被清理，最终为空
+    const off2 = setPatternEnabled(on, 1, false)
+    expect(off2.exemptions).toEqual([])
+    expectCoherent(off2, null)
+  })
+
+  it('删除：移除该条豁免，其后条目的豁免下标前移一位', () => {
+    const { snapshot } = load('abc def ghi', ['abc', 'def', 'ghi'])
+    let s = addExemption(snapshot, 0, 0)
+    s = addExemption(s, 1, 4)
+    s = addExemption(s, 2, 8)
+    // 删除中间 'def'：其豁免消失，'ghi' 的豁免下标 2 → 1，start 不变
+    const removed = removePattern(s, 1)
+    expect(removed.entries.map((e) => e.value)).toEqual(['abc', 'ghi'])
+    expect(removed.exemptions).toEqual([
+      { entry: 0, start: 0 },
+      { entry: 1, start: 8 },
+    ])
+    expectCoherent(removed, null)
+    // 删除第一条：后续全部前移
+    const removedFirst = removePattern(s, 0)
+    expect(removedFirst.exemptions).toEqual([
+      { entry: 0, start: 4 },
+      { entry: 1, start: 8 },
+    ])
+    expectCoherent(removedFirst, null)
+  })
+
+  it('追加新短语：既有豁免原样保留（新条目在末尾，无旧豁免引用）', () => {
+    const { snapshot } = load('abc', ['abc'])
+    const withEx = addExemption(snapshot, 0, 0)
+    const added = addPattern(withEx, 'xyz')
+    expect(added.exemptions).toEqual([{ entry: 0, start: 0 }])
+    expectCoherent(added, null)
+  })
+})
+
+describe('单次豁免：采纳固化、放弃回滚、载入清空', () => {
+  it('采纳固化当时豁免与遮蔽；之后继续增删豁免不改采纳稿，再次采纳才更新', () => {
+    const { snapshot } = load('xxx xxx', ['xxx'])
+    const d1 = adopt(addExemption(snapshot, 0, 0)) // 豁免第一处
+    expect(d1.masked).toBe('xxx ###')
+    expect(d1.exemptions).toEqual([{ entry: 0, start: 0 }])
+
+    // 在工作快照上再豁免第二处：工作预览变，采纳稿不变
+    const both = addExemption(addExemption(snapshot, 0, 0), 0, 4)
+    expect(both.result.masked).toBe('xxx xxx')
+    expect(d1.masked).toBe('xxx ###')
+    expect(d1.exemptions).toEqual([{ entry: 0, start: 0 }])
+
+    const d2 = adopt(both)
+    expect(d2.masked).toBe('xxx xxx')
+    expect(d2.exemptions).toHaveLength(2)
+  })
+
+  it('放弃：有采纳稿时回滚到采纳时的短语与豁免并从原文重算', () => {
+    const { snapshot } = load('xxx xxx xxx', ['xxx'])
+    const adopted = addExemption(snapshot, 0, 0)
+    const d = adopt(adopted)
+    // 继续：再加两处豁免并新增短语
+    let s = addExemption(adopted, 0, 4)
+    s = addPattern(s, 'yyy')
+    expect(s.exemptions).toHaveLength(2)
+    const rolled = rollback(snapshot.text, d.entries, d.exemptions)
+    expect(rolled.entries.map((e) => e.value)).toEqual(['xxx'])
+    expect(rolled.exemptions).toEqual([{ entry: 0, start: 0 }])
+    expect(rolled.result.masked).toBe('xxx ### ###')
+    expectCoherent(rolled, null)
+  })
+
+  it('放弃：无采纳稿时回到载入态（豁免清空）', () => {
+    const { session, snapshot } = load('xxx xxx', ['xxx'])
+    addExemption(snapshot, 0, 0)
+    const rolled = rollback(session.text, session.initial, [])
+    expect(rolled.exemptions).toEqual([])
+    expect(rolled.result.masked).toBe('### ###')
+  })
+
+  it('载入新文本：旧豁免全部清空（由页面以全新会话替换；loadSession 恒为空豁免）', () => {
+    const first = loadSession(file('abc', ['abc']))
+    expect(first.snapshot.exemptions).toEqual([])
+    const withEx = addExemption(first.snapshot, 0, 0)
+    expect(withEx.exemptions).toHaveLength(1)
+    // 载入另一份合法文件：得到的新会话豁免为空
+    const second = loadSession(file('zzz', ['zzz']))
+    expect(second.snapshot.exemptions).toEqual([])
+    expect(second.snapshot.text).toBe('zzz')
+  })
+})
+
+describe('单次豁免：故障注入与工具函数', () => {
+  it('登记豁免时重算抛错 → COUNT_FAILED，豁免与上次预览/采纳稿保留', () => {
+    const { snapshot } = load('abc abc', ['abc'])
+    const d = adopt(snapshot)
+    mockedMaskText.mockImplementationOnce(() => {
+      throw new Error('boom during exemption recompute')
+    })
+    expectError(COUNT_FAILED, () => addExemption(snapshot, 0, 0))
+    expect(snapshot.exemptions).toEqual([])
+    expect(snapshot.result.masked).toBe('### ###')
+    expect(d.masked).toBe('### ###')
+    // 恢复后登记成功
+    const ok = addExemption(snapshot, 0, 0)
+    expect(ok.exemptions).toEqual([{ entry: 0, start: 0 }])
+    expect(ok.result.masked).toBe('abc ###')
+  })
+
+  it('toExemptionRefs：工作集下标→启用序列下标，停用项被剔除，重复去重', () => {
+    const entries: PatternEntry[] = [
+      { value: 'a', enabled: true },
+      { value: 'b', enabled: false },
+      { value: 'c', enabled: true },
+    ]
+    const refs = toExemptionRefs(entries, [
+      { entry: 0, start: 3 },
+      { entry: 2, start: 7 },
+      { entry: 1, start: 9 }, // 停用：剔除
+      { entry: 0, start: 3 }, // 重复：去重
+    ])
+    expect(refs).toEqual([
+      { pattern: 0, start: 3 },
+      { pattern: 1, start: 7 }, // 'c' 是启用序列第 1 条
+    ])
+  })
+
+  it('sameExemptions 作为无序集合比较；exemptionsByEntry 按下标计数且停用为 0', () => {
+    const a: Exemption[] = [
+      { entry: 0, start: 1 },
+      { entry: 1, start: 2 },
+    ]
+    expect(sameExemptions(a, [{ entry: 1, start: 2 }, { entry: 0, start: 1 }])).toBe(true)
+    expect(sameExemptions(a, [{ entry: 0, start: 1 }])).toBe(false)
+    expect(sameExemptions(a, [
+      { entry: 0, start: 1 },
+      { entry: 1, start: 99 },
+    ])).toBe(false)
+    const entries: PatternEntry[] = [
+      { value: 'a', enabled: true },
+      { value: 'b', enabled: false },
+      { value: 'c', enabled: true },
+    ]
+    expect(exemptionsByEntry(entries, a)).toEqual([1, 0, 0])
+    const withC: Exemption[] = [
+      { entry: 0, start: 1 },
+      { entry: 2, start: 5 },
+    ]
+    expect(exemptionsByEntry(entries, withC)).toEqual([1, 0, 1])
+  })
+
+  it('重算故障时无效位置不进入重算（先校验后重算）', () => {
+    const { snapshot } = load('abc', ['abc'])
+    const calls = mockedMaskText.mock.calls.length
+    mockedMaskText.mockImplementationOnce(() => {
+      throw new Error('should not be called')
+    })
+    expectError(INVALID_EXEMPTION, () => addExemption(snapshot, 0, 2))
+    // 校验在重算之前：mock 未被消耗
+    expect(mockedMaskText.mock.calls.length).toBe(calls)
   })
 })

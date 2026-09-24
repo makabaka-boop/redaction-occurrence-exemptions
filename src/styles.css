@@ -141,6 +141,44 @@ button:hover:not(:disabled) {
   font-weight: 400;
 }
 
+.pattern-row .exempt-badge {
+  font-size: 11px;
+  color: #1d7a4d;
+  background: #e4f6ec;
+  border: 1px solid #b6e3cb;
+  border-radius: 4px;
+  padding: 1px 6px;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.pattern-row .exempt-pos {
+  width: 108px;
+  padding: 5px 6px;
+  border: 1px solid #b9bfca;
+  border-radius: 5px;
+  font-size: 12px;
+  box-sizing: border-box;
+}
+
+.pattern-row .exempt-btn {
+  padding: 5px 8px;
+  font-size: 12px;
+  white-space: nowrap;
+  border-color: #2f8f5b;
+  background: #2f8f5b;
+}
+
+.pattern-row .exempt-btn:hover:not(:disabled) {
+  background: #26764b;
+}
+
+.pattern-row .exempt-btn:disabled,
+.pattern-row .exempt-pos:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
 .actions {
   display: flex;
   align-items: center;
