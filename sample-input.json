@@ -1,0 +1,12 @@
+{
+  "text": "2026-09-18 10:02 DISPATCH RADIO TRANSCRIPT\nCallsign ALFA-77 and BRAVO-2 report the incident.\nSubject ZHANG SAN, ID 110101199003071234, phone 13800138000.\nALFA-77: Rear-end collision on route K-9, plate JING-A12345, insurer notified.\nBRAVO-2: Copy. Protect ZHANG SAN medical privacy; redact 13800138000 in the public copy.",
+  "patterns": [
+    "ALFA-77",
+    "BRAVO-2",
+    "ZHANG SAN",
+    "110101199003071234",
+    "13800138000",
+    "JING-A12345",
+    "K-9"
+  ]
+}

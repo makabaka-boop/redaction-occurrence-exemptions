@@ -1,0 +1,22 @@
+# 发布 Web 页面的宿主端口，可用环境变量覆盖：
+#   WEB_PORT=9090 docker compose up --build
+# 容器内固定监听 80。
+services:
+  web:
+    build:
+      context: .
+      target: runtime
+    ports:
+      - "${WEB_PORT:-8080}:80"
+    restart: unless-stopped
+
+  # 一次性验收服务：构建并运行 Vitest（朴素预言机对照、三秒时限等），
+  # 退出码即验收结果。用法：
+  #   docker compose --profile verify run --rm verify
+  verify:
+    profiles: ["verify"]
+    build:
+      context: .
+      target: build
+    working_dir: /app
+    command: ["npm", "test"]
